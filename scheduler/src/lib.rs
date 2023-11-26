@@ -8,16 +8,13 @@ use std::num::NonZeroUsize;
 
 mod scheduler;
 
-use schedulers::Empty;
+use schedulers::{Empty, RoundRobin};
 
 pub use crate::scheduler::{
     Pid, Process, ProcessState, Scheduler, SchedulingDecision, StopReason, Syscall, SyscallResult,
 };
 
 mod schedulers;
-
-// TODO import your scheduler here
-// This example imports the Empty scheduler
 
 /// Returns a structure that implements the `Scheduler` trait with a round robin scheduler policy
 ///
@@ -28,9 +25,8 @@ mod schedulers;
 ///                                 process. The scheduler will schedule the process
 ///                                 again of the remaining quanta is greater or equal to
 ///                                 the `minimum_remaining_timeslice` value.
-#[allow(unused_variables)]
 pub fn round_robin(timeslice: NonZeroUsize, minimum_remaining_timeslice: usize) -> impl Scheduler {
-    Empty
+    RoundRobin::new(timeslice, minimum_remaining_timeslice)
 }
 
 /// Returns a structure that implements the `Scheduler` trait with a priority queue scheduler policy
