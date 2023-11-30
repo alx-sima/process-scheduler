@@ -69,6 +69,7 @@ pub struct RoundRobin {
     will_panic: bool,
     max_pid: usize,
     processes: VecDeque<ProcessMeta>,
+    sleep_timer: VecDeque<(ProcessMeta, usize)>,
     /// The process that is currently running (or None if there isn't one).
     current_process: Option<CurrentProcessMeta>,
     /// The number of clock cycles that have passed since the scheduler was started.
@@ -81,6 +82,7 @@ impl RoundRobin {
             timeslice,
             minimum_remaining_timeslice,
             processes: VecDeque::new(),
+            sleep_timer: VecDeque::new(),
             current_process: None,
             max_pid: 0,
             clock: 0,
@@ -91,6 +93,7 @@ impl RoundRobin {
 
 impl Scheduler for RoundRobin {
     fn next(&mut self) -> SchedulingDecision {
+        update(&mut self.processes, &mut self.sleep_timer, self.clock);
         if self.will_panic {
             return SchedulingDecision::Panic;
         }
@@ -101,7 +104,18 @@ impl Scheduler for RoundRobin {
             };
         }
 
-        println!("t {:?}", self.processes);
+        // loop {
+        let (awaken, sleeping): (VecDeque<_>, VecDeque<_>) = self
+            .sleep_timer
+            .drain(..)
+            .partition(|(_, wake_time)| *wake_time <= self.clock);
+        self.sleep_timer = sleeping;
+
+        let awaken = awaken.into_iter().map(|(process, _)| ProcessMeta {
+            state: ProcessState::Ready,
+            ..process
+        });
+        self.processes.extend(awaken);
 
         if let Some(index) = self.processes.iter().enumerate().find_map(|(index, x)| {
             if x.state == ProcessState::Ready {
@@ -127,7 +141,25 @@ impl Scheduler for RoundRobin {
                     timeslice: self.timeslice,
                 };
             }
+        } else {
+            // There aren't any ready processes, wait for the first to wake up.
+            if let Some(first_wake) = self
+                .sleep_timer
+                .iter()
+                .map(|(_, wake_time)| wake_time)
+                .min()
+            {
+                let wait_interval = first_wake - self.clock;
+                println!("wait for {}", wait_interval);
+                self.clock = *first_wake;
+
+                return SchedulingDecision::Sleep(NonZeroUsize::new(wait_interval).unwrap());
+            } else {
+                // No process is ready to wake up.
+                return SchedulingDecision::Done;
+            }
         }
+        // }
         SchedulingDecision::Done
     }
 
@@ -140,6 +172,24 @@ impl Scheduler for RoundRobin {
                 }
                 println!("clock {:?}", self.clock);
                 // self.clock+= 1;
+                // Update the sleep timer.
+                if let Some(CurrentProcessMeta {
+                    schedule_time: _,
+                    execution_cycles,
+                    syscall_cycles,
+                    remaining_timeslice,
+                    process,
+                    ..
+                }) = self.current_process.as_mut()
+                {
+                    *syscall_cycles += 1;
+                    process.timings.0 += 1;
+                    process.timings.1 += 1;
+                    println!("{} {} {}", *remaining_timeslice, *syscall_cycles, remaining);
+                    *execution_cycles += *remaining_timeslice - *syscall_cycles - remaining;
+                    *remaining_timeslice = remaining;
+                    process.last_update = self.clock;
+                }
                 let syscall_result = match syscall {
                     Fork(_) => {
                         self.max_pid += 1;
@@ -165,7 +215,10 @@ impl Scheduler for RoundRobin {
                     Signal(event) => {
                         todo!()
                         // for proc in &mut self.processes {
-                        //     if let ProcessState::Waiting { event: Some(proc_event) } = proc.state {
+                        //     if let ProcessState::Waiting {
+                        //         event: Some(proc_event),
+                        //     } = proc.state
+                        //     {
                         //         if proc_event == event {
                         //             proc.state = ProcessState::Ready;
                         //         }
@@ -178,7 +231,6 @@ impl Scheduler for RoundRobin {
                         todo!()
                         // if let Some(mut process) = self.processes.pop_front() {
                         //     process.state = ProcessState::Waiting { event: Some(event) };
-                        //     process.timings.0 += self.timeslice.get() - remaining;
 
                         //     self.processes.push_back(process);
                         //     SyscallResult::Success
@@ -187,38 +239,27 @@ impl Scheduler for RoundRobin {
                         // }
                     }
                     Sleep(time) => {
-                        todo!()
-                        // if let Some(mut process) = self.processes.pop_front() {
-                        //     process.state = ProcessState::Waiting { event: None };
-                        //     process.timings.0 += self.timeslice.get() - remaining;
+                        if let Some(CurrentProcessMeta {
+                            mut process,
+                            execution_cycles,
+                            ..
+                        }) = self.current_process.take()
+                        {
+                            process.state = ProcessState::Waiting { event: None };
+                            process.timings.0 += execution_cycles;
+                            process.timings.2 += execution_cycles;
+                            process.last_update = self.clock;
 
-                        //     self.sleep_timer.sleeping_processes.push_back((process, time));
-                        //     SyscallResult::Success
-                        // } else {
-                        //     SyscallResult::NoRunningProcess
-                        // }
+                            print!("sleeping until{}", self.clock + time);
+                            self.sleep_timer.push_back((process, self.clock + time));
+                            SyscallResult::Success
+                        } else {
+                            SyscallResult::NoRunningProcess
+                        }
                     }
                 };
-                // Update the sleep timer.
-                if let Some(CurrentProcessMeta {
-                    schedule_time: _,
-                    execution_cycles,
-                    syscall_cycles,
-                    remaining_timeslice,
-                    process,
-                    ..
-                }) = self.current_process.as_mut()
-                {
-                    *syscall_cycles += 1;
-                    process.timings.0 += 1;
-                    process.timings.1 += 1;
-                    println!("{} {} {}", *remaining_timeslice, *syscall_cycles, remaining);
-                    *execution_cycles += *remaining_timeslice - *syscall_cycles - remaining;
-                    *remaining_timeslice = remaining;
-                    process.last_update = self.clock;
-                }
 
-                update(&mut self.processes, self.clock);
+                update(&mut self.processes, &mut self.sleep_timer, self.clock);
 
                 if let Some(mut current) = self.current_process.take() {
                     if current.remaining_timeslice < self.minimum_remaining_timeslice {
@@ -230,11 +271,6 @@ impl Scheduler for RoundRobin {
                             current.process.pid(),
                             current.execution_cycles
                         );
-
-                        // current.process.timings.0 += self.clock - current.schedule_time;
-                        // current.process.timings.2 += current.execution_cycles;
-                        // current.process.last_update = self.clock;
-                        println!("test");
                         self.processes.push_back(current.process);
                     } else {
                         self.current_process = Some(current);
@@ -250,7 +286,7 @@ impl Scheduler for RoundRobin {
                     current.process.timings.2 += current.remaining_timeslice;
                     current.process.last_update = self.clock;
 
-                    update(&mut self.processes, self.clock);
+                    update(&mut self.processes, &mut self.sleep_timer, self.clock);
                     self.processes.push_back(current.process);
 
                     SyscallResult::Success
@@ -271,6 +307,10 @@ impl Scheduler for RoundRobin {
         [
             processes,
             self.processes.iter().map(|x| x as &dyn Process).collect(),
+            self.sleep_timer
+                .iter()
+                .map(|(x, _)| x as &dyn Process)
+                .collect(),
         ]
         .concat()
     }
@@ -281,10 +321,12 @@ fn fork(pid: usize, creation_time: usize) -> ProcessMeta {
     new_process
 }
 
-fn update(p: &mut VecDeque<ProcessMeta>, time: usize) {
-    for i in p.iter_mut() {
+fn update(p: &mut VecDeque<ProcessMeta>, s: &mut VecDeque<(ProcessMeta, usize)>, time: usize) {
+    let s = s.into_iter().map(|(process, _)| process);
+    for i in p.iter_mut().chain(s) {
         i.timings.0 += time - i.last_update;
         println!("{}: {}", i.pid(), time - i.last_update);
+        println!("updated {}", i.last_update);
         i.last_update = time;
     }
     println!("clock {} update {:?}", time, p);
