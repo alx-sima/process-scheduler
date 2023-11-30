@@ -14,6 +14,8 @@
 mod empty;
 pub use empty::Empty;
 
+mod process_manager;
+
 // TODO import your schedulers here
 mod round_robin;
 pub use round_robin::RoundRobin;
