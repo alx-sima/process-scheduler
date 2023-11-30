@@ -166,30 +166,15 @@ impl Scheduler for RoundRobin {
     fn stop(&mut self, reason: StopReason) -> SyscallResult {
         match reason {
             StopReason::Syscall { syscall, remaining } => {
-                if let Some(current) = self.current_process.as_ref() {
+                if let Some(current) = self.current_process.as_mut() {
                     println!("{} {}", current.remaining_timeslice, remaining);
                     self.clock += current.remaining_timeslice - remaining;
+                    current.process.timings.0 += 1;
+                    current.process.timings.1 += 1;
+                    current.syscall_cycles += 1;
                 }
                 println!("clock {:?}", self.clock);
-                // self.clock+= 1;
-                // Update the sleep timer.
-                if let Some(CurrentProcessMeta {
-                    schedule_time: _,
-                    execution_cycles,
-                    syscall_cycles,
-                    remaining_timeslice,
-                    process,
-                    ..
-                }) = self.current_process.as_mut()
-                {
-                    *syscall_cycles += 1;
-                    process.timings.0 += 1;
-                    process.timings.1 += 1;
-                    println!("{} {} {}", *remaining_timeslice, *syscall_cycles, remaining);
-                    *execution_cycles += *remaining_timeslice - *syscall_cycles - remaining;
-                    *remaining_timeslice = remaining;
-                    process.last_update = self.clock;
-                }
+
                 let syscall_result = match syscall {
                     Fork(_) => {
                         self.max_pid += 1;
@@ -201,51 +186,58 @@ impl Scheduler for RoundRobin {
                     }
                     Exit => {
                         if let Some(current) = self.current_process.take() {
-                            // self.clock += current.remaining_timeslice - remaining;
-                            // self.clock -= 1;
-                            // update(&mut self.processes, self.clock);
+                            // Killing `init` while other processes are
+                            // running will result in a panic.
                             if current.process.pid() == 1 && self.processes.len() != 0 {
                                 self.will_panic = true;
                             }
+
                             SyscallResult::Success
                         } else {
                             SyscallResult::NoRunningProcess
                         }
                     }
                     Signal(event) => {
-                        todo!()
-                        // for proc in &mut self.processes {
-                        //     if let ProcessState::Waiting {
-                        //         event: Some(proc_event),
-                        //     } = proc.state
-                        //     {
-                        //         if proc_event == event {
-                        //             proc.state = ProcessState::Ready;
-                        //         }
-                        //     }
-                        // }
+                        for proc in &mut self.processes {
+                            if let ProcessState::Waiting {
+                                event: Some(proc_event),
+                            } = proc.state
+                            {
+                                if proc_event == event {
+                                    proc.state = ProcessState::Ready;
+                                }
+                            }
+                        }
 
-                        // SyscallResult::Success
+                        SyscallResult::Success
                     }
                     Wait(event) => {
-                        todo!()
-                        // if let Some(mut process) = self.processes.pop_front() {
-                        //     process.state = ProcessState::Waiting { event: Some(event) };
-
-                        //     self.processes.push_back(process);
-                        //     SyscallResult::Success
-                        // } else {
-                        //     SyscallResult::NoRunningProcess
-                        // }
+                        if let Some(mut current) = self.current_process.take() {
+                            current.process.state = ProcessState::Waiting { event: Some(event) };
+                            current.execution_cycles +=
+                                self.clock - current.process.last_update - current.syscall_cycles;
+                            current.process.timings.0 += current.execution_cycles;
+                            current.process.timings.2 += current.execution_cycles;
+                            current.process.last_update = self.clock;
+                            self.processes.push_back(current.process);
+                            SyscallResult::Success
+                        } else {
+                            SyscallResult::NoRunningProcess
+                        }
                     }
                     Sleep(time) => {
                         if let Some(CurrentProcessMeta {
                             mut process,
-                            execution_cycles,
+                            mut execution_cycles,
+                            syscall_cycles,
                             ..
                         }) = self.current_process.take()
                         {
                             process.state = ProcessState::Waiting { event: None };
+                            let execution_time = self.clock - process.last_update;
+                            if execution_time > syscall_cycles {
+                                execution_cycles += execution_time - syscall_cycles;
+                            }
                             process.timings.0 += execution_cycles;
                             process.timings.2 += execution_cycles;
                             process.last_update = self.clock;
@@ -259,6 +251,21 @@ impl Scheduler for RoundRobin {
                     }
                 };
 
+                // Update the timer.
+                if let Some(CurrentProcessMeta {
+                    schedule_time: _,
+                    execution_cycles,
+                    syscall_cycles,
+                    remaining_timeslice,
+                    process,
+                    ..
+                }) = self.current_process.as_mut()
+                {
+                    println!("{} {} {}", *remaining_timeslice, *syscall_cycles, remaining);
+                    *execution_cycles += *remaining_timeslice - (*syscall_cycles + remaining);
+                    *remaining_timeslice = remaining;
+                    process.last_update = self.clock;
+                }
                 update(&mut self.processes, &mut self.sleep_timer, self.clock);
 
                 if let Some(mut current) = self.current_process.take() {
