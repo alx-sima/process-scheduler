@@ -19,3 +19,6 @@ mod process_manager;
 // TODO import your schedulers here
 mod round_robin;
 pub use round_robin::RoundRobin;
+
+mod priority_queue;
+pub use priority_queue::PriorityQueue;
