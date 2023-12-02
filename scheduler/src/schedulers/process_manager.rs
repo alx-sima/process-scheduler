@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    Pid, Process, ProcessState, StopReason,
+    Pid, Process, ProcessState, SchedulingDecision, StopReason,
     Syscall::{Exit, Fork, Signal, Sleep, Wait},
     SyscallResult,
 };
@@ -27,7 +27,8 @@ pub struct ProcessMeta {
     pub(super) pid: Pid,
     pub(super) state: ProcessState,
     pub(super) last_update: usize,
-    priority: i8,
+    pub(super) priority: i8,
+    max_priority: i8,
     /// Information about the process' run time
     /// Tota, Syscall, Execution
     timings: (usize, usize, usize),
@@ -38,10 +39,21 @@ impl ProcessMeta {
         ProcessMeta {
             pid,
             priority,
+            max_priority: priority,
             last_update: creation_time,
             state: ProcessState::Ready,
             timings: (0, 0, 0),
         }
+    }
+
+    pub(super) fn increase_priority(&mut self) {
+        self.priority += 1;
+        self.priority = self.priority.min(self.max_priority);
+    }
+
+    pub(super) fn decrease_priority(&mut self) {
+        self.priority -= 1;
+        self.priority = self.priority.max(0);
     }
 }
 
@@ -114,6 +126,60 @@ impl ProcessManager {
             max_pid: 0,
             timeslice,
             clock: 0,
+        }
+    }
+
+    pub fn next(&mut self) -> SchedulingDecision {
+        self.update_timings();
+        self.wake_processes();
+
+        if self.will_panic {
+            return SchedulingDecision::Panic;
+        }
+
+        if let Some(current) = &self.current_process {
+            if current.process.state() == ProcessState::Running {
+                return SchedulingDecision::Run {
+                    pid: current.process.pid(),
+                    timeslice: NonZeroUsize::new(current.remaining_timeslice).unwrap(),
+                };
+            }
+        }
+
+        if let Some(current) = self.current_process.take() {
+            self.processes.push_back(current.process);
+        }
+
+        self.current_process = self.processes.get_next_process(self.timeslice);
+
+        if let Some(current) = &self.current_process {
+            return SchedulingDecision::Run {
+                pid: current.process.pid(),
+                timeslice: NonZeroUsize::new(current.remaining_timeslice).unwrap(),
+            };
+        }
+
+        // There aren't any ready processes, wait for the first to wake up.
+        if let Some(first_wake) = self
+            .sleeping_processes
+            .iter()
+            .map(|(_, wake_time)| wake_time)
+            .min()
+        {
+            let wait_interval = first_wake - self.clock;
+            self.clock = *first_wake;
+
+            return SchedulingDecision::Sleep(NonZeroUsize::new(wait_interval).unwrap());
+        } else {
+            // There are no processes to be awaken. If there still
+            // are processes waiting, signal a deadlock.
+            if
+            /*self.0.processes.len() != 0 ||*/
+            self.waiting_processes.len() != 0 {
+                return SchedulingDecision::Deadlock;
+            } else {
+                return SchedulingDecision::Done;
+            }
         }
     }
 

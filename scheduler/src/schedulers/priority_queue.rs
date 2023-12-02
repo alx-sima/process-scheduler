@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use crate::{Process, ProcessState, Scheduler, SchedulingDecision};
+use crate::{Process, ProcessState, Scheduler, SchedulingDecision, StopReason};
 
 use super::process_manager::{CurrentProcessMeta, ProcessContainer, ProcessManager, ProcessMeta};
 
@@ -31,61 +31,21 @@ impl PriorityQueue {
 
 impl Scheduler for PriorityQueue {
     fn next(&mut self) -> SchedulingDecision {
-        self.0.update_timings();
-        self.0.wake_processes();
-
-        if self.0.will_panic {
-            return SchedulingDecision::Panic;
-        }
-
-        if let Some(current) = &self.0.current_process {
-            if current.process.state() == ProcessState::Running {
-                return SchedulingDecision::Run {
-                    pid: current.process.pid(),
-                    timeslice: NonZeroUsize::new(current.remaining_timeslice).unwrap(),
-                };
-            }
-        }
-
-        if let Some(current) = self.0.current_process.take() {
-            self.0.processes.push_back(current.process);
-        }
-
-        self.0.current_process = self.0.processes.get_next_process(self.0.timeslice);
-
-        if let Some(current) = &self.0.current_process {
-            return SchedulingDecision::Run {
-                pid: current.process.pid(),
-                timeslice: NonZeroUsize::new(current.remaining_timeslice).unwrap(),
-            };
-        }
-
-        // There aren't any ready processes, wait for the first to wake up.
-        if let Some(first_wake) = self
-            .0
-            .sleeping_processes
-            .iter()
-            .map(|(_, wake_time)| wake_time)
-            .min()
-        {
-            let wait_interval = first_wake - self.0.clock;
-            self.0.clock = *first_wake;
-
-            return SchedulingDecision::Sleep(NonZeroUsize::new(wait_interval).unwrap());
-        } else {
-            // There are no processes to be awaken. If there still
-            // are processes waiting, signal a deadlock.
-            if
-            /*self.0.processes.len() != 0 ||*/
-            self.0.waiting_processes.len() != 0 {
-                return SchedulingDecision::Deadlock;
-            } else {
-                return SchedulingDecision::Done;
-            }
-        }
+        self.0.next()
     }
 
-    fn stop(&mut self, reason: crate::StopReason) -> crate::SyscallResult {
+    fn stop(&mut self, reason: StopReason) -> crate::SyscallResult {
+        if let Some(current_process) = self.0.current_process.as_mut() {
+            match reason {
+                StopReason::Syscall {
+                    syscall: _,
+                    remaining: _,
+                } => current_process.process.increase_priority(),
+                StopReason::Expired => {
+                    current_process.process.decrease_priority();
+                }
+            }
+        }
         self.0.handle_stop(reason)
     }
 
