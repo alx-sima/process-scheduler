@@ -1,4 +1,4 @@
-use crate::{Process, Scheduler, SchedulingDecision, StopReason, SyscallResult};
+use crate::{Process, ProcessState, Scheduler, SchedulingDecision, StopReason, SyscallResult};
 
 use std::num::NonZeroUsize;
 
@@ -15,19 +15,25 @@ impl RoundRobin {
 impl Scheduler for RoundRobin {
     fn next(&mut self) -> SchedulingDecision {
         self.0.update_timings();
+        self.0.wake_processes();
 
         if self.0.will_panic {
             return SchedulingDecision::Panic;
         }
 
         if let Some(current) = &self.0.current_process {
-            return SchedulingDecision::Run {
-                pid: current.process.pid(),
-                timeslice: NonZeroUsize::new(current.remaining_timeslice).unwrap(),
-            };
+            if current.process.state() == ProcessState::Running {
+                return SchedulingDecision::Run {
+                    pid: current.process.pid(),
+                    timeslice: NonZeroUsize::new(current.remaining_timeslice).unwrap(),
+                };
+            }
         }
 
-        self.0.wake_processes();
+        if let Some(current) = self.0.current_process.take() {
+            self.0.processes.push_back(current.process);
+        }
+
         self.0.current_process = self.0.get_next_process();
 
         if let Some(current) = &self.0.current_process {
@@ -40,7 +46,7 @@ impl Scheduler for RoundRobin {
         // There aren't any ready processes, wait for the first to wake up.
         if let Some(first_wake) = self
             .0
-            .sleep_timer
+            .sleeping_processes
             .iter()
             .map(|(_, wake_time)| wake_time)
             .min()
@@ -52,7 +58,7 @@ impl Scheduler for RoundRobin {
         } else {
             // There are no processes to be awaken. If there still
             // are processes waiting, signal a deadlock.
-            if self.0.processes.len() != 0 {
+            if self.0.processes.len() != 0 || self.0.waiting_processes.len() != 0 {
                 return SchedulingDecision::Deadlock;
             } else {
                 return SchedulingDecision::Done;

@@ -1,24 +1,23 @@
-use std::{collections::VecDeque, num::NonZeroUsize};
+use std::{
+    collections::{HashMap, VecDeque},
+    num::NonZeroUsize,
+};
 
 use crate::{
     Pid, Process, ProcessState, StopReason,
     Syscall::{Exit, Fork, Signal, Sleep, Wait},
     SyscallResult,
 };
+
 #[derive(Debug)]
 pub struct ProcessMeta {
     pid: Pid,
     state: ProcessState,
     last_update: usize,
     priority: i8,
-    timings: (
-        // Total
-        usize,
-        // Syscall
-        usize,
-        // Execution
-        usize,
-    ),
+    /// Information about the process' run time
+    /// Tota, Syscall, Execution
+    timings: (usize, usize, usize),
 }
 
 impl ProcessMeta {
@@ -56,19 +55,30 @@ impl Process for ProcessMeta {
 }
 
 #[derive(Debug)]
+/// Information about the process that is currently using the CPU.
 pub struct CurrentProcessMeta {
+    /// The current process.
     pub process: ProcessMeta,
+    /// The cycles that the process has executed on this run.
     pub execution_cycles: usize,
-    pub remaining_timeslice: usize,
+    /// The cycles that the process has spent in syscalls on this run.
     pub syscall_cycles: usize,
+    /// The time this process has left before it is preempted.
+    pub remaining_timeslice: usize,
 }
 pub struct ProcessManager {
+    /// The maximum timeslice that is given to each process.
     pub timeslice: NonZeroUsize,
+    /// The minimum timeslice that a process must have left
+    /// after a syscall in order to remain on the CPU.
     pub minimum_remaining_timeslice: usize,
+    /// Wether the scheduler will panic on the next query.
     pub will_panic: bool,
+    /// The maximum pid that has been assigned yet.
     pub max_pid: usize,
     pub processes: VecDeque<ProcessMeta>,
-    pub sleep_timer: VecDeque<(ProcessMeta, usize)>,
+    pub sleeping_processes: VecDeque<(ProcessMeta, usize)>,
+    pub waiting_processes: HashMap<usize, VecDeque<ProcessMeta>>,
     /// The process that is currently running (or None if there isn't one).
     pub current_process: Option<CurrentProcessMeta>,
     /// The number of clock cycles that have passed since the scheduler was started.
@@ -80,7 +90,8 @@ impl ProcessManager {
         Self {
             minimum_remaining_timeslice,
             processes: VecDeque::new(),
-            sleep_timer: VecDeque::new(),
+            sleeping_processes: VecDeque::new(),
+            waiting_processes: HashMap::new(),
             current_process: None,
             will_panic: false,
             max_pid: 0,
@@ -92,20 +103,22 @@ impl ProcessManager {
     pub fn get_processes(&self) -> Vec<&ProcessMeta> {
         self.processes
             .iter()
-            .chain(self.sleep_timer.iter().map(|(x, _)| x))
+            .chain(self.sleeping_processes.iter().map(|(x, _)| x))
+            .chain(self.waiting_processes.values().flatten())
             .collect()
     }
 
     /// Wake up all processes that finished waiting.
     pub fn wake_processes(&mut self) {
-        let sleeping = self.sleep_timer.drain(..);
+        let sleeping = self.sleeping_processes.drain(..);
         let (awaken, sleeping) = sleeping.partition(|(_, wake_time)| *wake_time <= self.clock);
-        self.sleep_timer = sleeping;
+        self.sleeping_processes = sleeping;
 
         let awaken = awaken.into_iter().map(|(process, _)| ProcessMeta {
             state: ProcessState::Ready,
             ..process
         });
+
         self.processes.extend(awaken);
     }
 
@@ -125,18 +138,22 @@ impl ProcessManager {
             }
             waiting_processes.push_back(process);
         }
+
         self.processes = waiting_processes;
         None
     }
 
     pub fn update_timings(&mut self) {
-        let p = &mut self.processes;
-        let s = &mut self.sleep_timer;
-        let time = self.clock;
-        let s = s.into_iter().map(|(process, _)| process);
-        for i in p.iter_mut().chain(s) {
-            let elapsed_time = time - i.last_update;
-            i.last_update = time;
+        let processes = self.processes.iter_mut();
+
+        let sleeping_processes = self.sleeping_processes.iter_mut();
+        let sleeping_processes = sleeping_processes.map(|(process, _)| process);
+
+        let waiting_processes = self.waiting_processes.values_mut().flatten();
+
+        for i in processes.chain(sleeping_processes).chain(waiting_processes) {
+            let elapsed_time = self.clock - i.last_update;
+            i.last_update = self.clock;
 
             i.timings.0 += elapsed_time;
             if i.state == ProcessState::Running {
@@ -149,7 +166,6 @@ impl ProcessManager {
         match reason {
             StopReason::Syscall { syscall, remaining } => {
                 if let Some(current) = self.current_process.as_mut() {
-                    println!("{} {}", current.remaining_timeslice, remaining);
                     self.clock += current.remaining_timeslice - remaining;
                     current.process.timings.0 += 1;
                     current.process.timings.1 += 1;
@@ -171,7 +187,9 @@ impl ProcessManager {
                             // Killing `init` while other processes are
                             // running will result in a panic.
                             if current.process.pid() == 1
-                                && (self.processes.len() != 0 || self.sleep_timer.len() != 0)
+                                && (self.processes.len() != 0
+                                    || self.sleeping_processes.len() != 0
+                                    || self.waiting_processes.len() != 0)
                             {
                                 self.will_panic = true;
                             }
@@ -182,22 +200,21 @@ impl ProcessManager {
                         }
                     }
                     Signal(event) => {
-                        for proc in &mut self.processes {
-                            if let ProcessState::Waiting {
-                                event: Some(proc_event),
-                            } = proc.state
-                            {
-                                if proc_event == event {
-                                    proc.state = ProcessState::Ready;
-                                }
-                            }
-                        }
+                        if let Some(waiting_processes) = self.waiting_processes.remove(&event) {
+                            let waiting_processes =
+                                waiting_processes.into_iter().map(|mut process| {
+                                    process.state = ProcessState::Ready;
+                                    process
+                                });
 
+                            self.processes.extend(waiting_processes);
+                        }
                         SyscallResult::Success
                     }
                     Wait(event) => {
                         if let Some(mut current) = self.current_process.take() {
                             current.process.state = ProcessState::Waiting { event: Some(event) };
+
                             let execution_time = self.clock - current.process.last_update;
                             if execution_time > current.syscall_cycles {
                                 current.execution_cycles += execution_time - current.syscall_cycles;
@@ -205,7 +222,10 @@ impl ProcessManager {
                             current.process.timings.0 += current.execution_cycles;
                             current.process.timings.2 += current.execution_cycles;
                             current.process.last_update = self.clock;
-                            self.processes.push_back(current.process);
+                            self.waiting_processes
+                                .entry(event)
+                                .or_insert_with(VecDeque::new)
+                                .push_back(current.process);
                             SyscallResult::Success
                         } else {
                             SyscallResult::NoRunningProcess
@@ -228,7 +248,8 @@ impl ProcessManager {
                             process.timings.2 += execution_cycles;
                             process.last_update = self.clock;
 
-                            self.sleep_timer.push_back((process, self.clock + time));
+                            self.sleeping_processes
+                                .push_back((process, self.clock + time));
                             SyscallResult::Success
                         } else {
                             SyscallResult::NoRunningProcess
@@ -245,30 +266,28 @@ impl ProcessManager {
                     ..
                 }) = self.current_process.as_mut()
                 {
-                    let execution_time = *remaining_timeslice - remaining;
-                    if execution_time > *syscall_cycles {
-                        *execution_cycles += execution_time - *syscall_cycles;
+                    if process.state == ProcessState::Running {
+                        let execution_time = *remaining_timeslice - remaining;
+                        if execution_time > *syscall_cycles {
+                            *execution_cycles += execution_time - *syscall_cycles;
+                        }
+                        *remaining_timeslice = remaining;
+                        process.last_update = self.clock;
                     }
-                    *remaining_timeslice = remaining;
-                    process.last_update = self.clock;
                 }
                 self.update_timings();
 
-                if let Some(mut current) = self.current_process.take() {
+                if let Some(current) = self.current_process.as_mut() {
                     if current.remaining_timeslice < self.minimum_remaining_timeslice {
                         current.process.state = ProcessState::Ready;
                         current.process.timings.0 += current.execution_cycles;
                         current.process.timings.2 += current.execution_cycles;
-
-                        self.processes.push_back(current.process);
-                    } else {
-                        self.current_process = Some(current);
                     }
                 }
                 syscall_result
             }
             StopReason::Expired => {
-                if let Some(mut current) = self.current_process.take() {
+                if let Some(current) = self.current_process.as_mut() {
                     self.clock += current.remaining_timeslice;
                     current.process.state = ProcessState::Ready;
                     current.process.timings.0 += current.remaining_timeslice;
@@ -276,7 +295,6 @@ impl ProcessManager {
                     current.process.last_update = self.clock;
 
                     self.update_timings();
-                    self.processes.push_back(current.process);
 
                     SyscallResult::Success
                 } else {
