@@ -1,14 +1,56 @@
 use crate::{Process, ProcessState, Scheduler, SchedulingDecision, StopReason, SyscallResult};
 
-use std::num::NonZeroUsize;
+use std::{collections::VecDeque, num::NonZeroUsize};
 
-use super::process_manager::ProcessManager;
+use super::process_manager::{CurrentProcessMeta, ProcessContainer, ProcessManager, ProcessMeta};
 
 pub struct RoundRobin(ProcessManager);
 
+impl ProcessContainer for VecDeque<ProcessMeta> {
+    fn get_next_process(&mut self, timeslice: NonZeroUsize) -> Option<CurrentProcessMeta> {
+        let mut waiting_processes = VecDeque::new();
+
+        while let Some(mut process) = self.pop_front() {
+            if process.state == ProcessState::Ready {
+                process.state = ProcessState::Running;
+                self.extend(waiting_processes);
+                return Some(CurrentProcessMeta {
+                    process,
+                    remaining_timeslice: timeslice.get(),
+                    execution_cycles: 0,
+                    syscall_cycles: 0,
+                });
+            }
+            waiting_processes.push_back(process);
+        }
+
+        *self = waiting_processes;
+        None
+    }
+
+    fn push_back(&mut self, process: ProcessMeta) {
+        self.push_back(process);
+    }
+
+    fn get_iterator<'a>(&'a self) -> Box<dyn ExactSizeIterator<Item = &'a ProcessMeta> + 'a> {
+        Box::new(self.iter())
+    }
+
+    fn get_mut_iterator<'a>(
+        &'a mut self,
+    ) -> Box<dyn ExactSizeIterator<Item = &'a mut ProcessMeta> + 'a> {
+        Box::new(self.iter_mut())
+    }
+}
+
 impl RoundRobin {
     pub fn new(timeslice: NonZeroUsize, minimum_remaining_timeslice: usize) -> Self {
-        Self(ProcessManager::new(timeslice, minimum_remaining_timeslice))
+        let container = Box::new(VecDeque::new());
+        Self(ProcessManager::new(
+            container,
+            timeslice,
+            minimum_remaining_timeslice,
+        ))
     }
 }
 
@@ -34,7 +76,7 @@ impl Scheduler for RoundRobin {
             self.0.processes.push_back(current.process);
         }
 
-        self.0.current_process = self.0.get_next_process();
+        self.0.current_process = self.0.processes.get_next_process(self.0.timeslice);
 
         if let Some(current) = &self.0.current_process {
             return SchedulingDecision::Run {
@@ -58,7 +100,9 @@ impl Scheduler for RoundRobin {
         } else {
             // There are no processes to be awaken. If there still
             // are processes waiting, signal a deadlock.
-            if self.0.processes.len() != 0 || self.0.waiting_processes.len() != 0 {
+            if
+            /*self.0.processes.len() != 0 ||*/
+            self.0.waiting_processes.len() != 0 {
                 return SchedulingDecision::Deadlock;
             } else {
                 return SchedulingDecision::Done;

@@ -9,11 +9,24 @@ use crate::{
     SyscallResult,
 };
 
+pub trait ProcessContainer {
+    fn get_next_process(&mut self, timeslice: NonZeroUsize) -> Option<CurrentProcessMeta>;
+    fn push_back(&mut self, process: ProcessMeta);
+    fn append(&mut self, iter: Box<dyn Iterator<Item = ProcessMeta>>) {
+        iter.into_iter().for_each(|x| self.push_back(x))
+    }
+
+    fn get_iterator<'a>(&'a self) -> Box<dyn ExactSizeIterator<Item = &'a ProcessMeta> + 'a>;
+    fn get_mut_iterator<'a>(
+        &'a mut self,
+    ) -> Box<dyn ExactSizeIterator<Item = &'a mut ProcessMeta> + 'a>;
+}
+
 #[derive(Debug)]
 pub struct ProcessMeta {
-    pid: Pid,
-    state: ProcessState,
-    last_update: usize,
+    pub(super) pid: Pid,
+    pub(super) state: ProcessState,
+    pub(super) last_update: usize,
     priority: i8,
     /// Information about the process' run time
     /// Tota, Syscall, Execution
@@ -76,7 +89,7 @@ pub struct ProcessManager {
     pub will_panic: bool,
     /// The maximum pid that has been assigned yet.
     pub max_pid: usize,
-    pub processes: VecDeque<ProcessMeta>,
+    pub processes: Box<dyn ProcessContainer + Send>,
     pub sleeping_processes: VecDeque<(ProcessMeta, usize)>,
     pub waiting_processes: HashMap<usize, VecDeque<ProcessMeta>>,
     /// The process that is currently running (or None if there isn't one).
@@ -86,10 +99,14 @@ pub struct ProcessManager {
 }
 
 impl ProcessManager {
-    pub fn new(timeslice: NonZeroUsize, minimum_remaining_timeslice: usize) -> Self {
+    pub fn new(
+        container: Box<impl ProcessContainer + Send + 'static>,
+        timeslice: NonZeroUsize,
+        minimum_remaining_timeslice: usize,
+    ) -> Self {
         Self {
             minimum_remaining_timeslice,
-            processes: VecDeque::new(),
+            processes: container,
             sleeping_processes: VecDeque::new(),
             waiting_processes: HashMap::new(),
             current_process: None,
@@ -102,7 +119,7 @@ impl ProcessManager {
 
     pub fn get_processes(&self) -> Vec<&ProcessMeta> {
         self.processes
-            .iter()
+            .get_iterator()
             .chain(self.sleeping_processes.iter().map(|(x, _)| x))
             .chain(self.waiting_processes.values().flatten())
             .collect()
@@ -119,32 +136,11 @@ impl ProcessManager {
             ..process
         });
 
-        self.processes.extend(awaken);
-    }
-
-    pub fn get_next_process(&mut self) -> Option<CurrentProcessMeta> {
-        let mut waiting_processes = VecDeque::new();
-
-        while let Some(mut process) = self.processes.pop_front() {
-            if process.state == ProcessState::Ready {
-                process.state = ProcessState::Running;
-                self.processes.extend(waiting_processes);
-                return Some(CurrentProcessMeta {
-                    process,
-                    remaining_timeslice: self.timeslice.get(),
-                    execution_cycles: 0,
-                    syscall_cycles: 0,
-                });
-            }
-            waiting_processes.push_back(process);
-        }
-
-        self.processes = waiting_processes;
-        None
+        self.processes.append(Box::new(awaken));
     }
 
     pub fn update_timings(&mut self) {
-        let processes = self.processes.iter_mut();
+        let processes = self.processes.get_mut_iterator();
 
         let sleeping_processes = self.sleeping_processes.iter_mut();
         let sleeping_processes = sleeping_processes.map(|(process, _)| process);
@@ -187,7 +183,7 @@ impl ProcessManager {
                             // Killing `init` while other processes are
                             // running will result in a panic.
                             if current.process.pid() == 1
-                                && (self.processes.len() != 0
+                                && (self.processes.get_iterator().len() != 0
                                     || self.sleeping_processes.len() != 0
                                     || self.waiting_processes.len() != 0)
                             {
@@ -207,7 +203,7 @@ impl ProcessManager {
                                     process
                                 });
 
-                            self.processes.extend(waiting_processes);
+                            self.processes.append(Box::new(waiting_processes));
                         }
                         SyscallResult::Success
                     }
