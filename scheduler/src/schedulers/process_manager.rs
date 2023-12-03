@@ -153,10 +153,12 @@ impl<T> ProcessManager<T>
         );
 
         if let Some(current) = &self.current_process {
-            return SchedulingDecision::Run {
-                pid: current.process.pid(),
-                timeslice: NonZeroUsize::new(current.remaining_timeslice).unwrap(),
-            };
+            if let Some(timeslice) = NonZeroUsize::new(current.remaining_timeslice) {
+                return SchedulingDecision::Run {
+                    pid: current.process.pid(),
+                    timeslice,
+                };
+            }
         }
 
         // There aren't any ready processes, wait for the first to wake up.
@@ -169,7 +171,11 @@ impl<T> ProcessManager<T>
             let wait_interval = first_wake - self.clock;
             self.clock = *first_wake;
 
-            SchedulingDecision::Sleep(NonZeroUsize::new(wait_interval).unwrap())
+            // This won't fail, because, for sleeping processes,
+            // wake_time is later than self.clock (now).
+            let sleep_duration = NonZeroUsize::new(wait_interval).unwrap();
+
+            SchedulingDecision::Sleep(sleep_duration)
         } else {
             // There are no processes to be awaken. If there still
             // are processes waiting, signal a deadlock.
@@ -202,7 +208,7 @@ impl<T> ProcessManager<T>
                 }
 
                 let syscall_result = match syscall {
-                    Fork(priority) => {// Add the execution time to the current process' counter.
+                    Fork(priority) => {
 
                         self.max_pid += 1;
                         let new_process = T::create_process(self, priority);
@@ -216,9 +222,9 @@ impl<T> ProcessManager<T>
                             // Killing `init` while other processes are
                             // running will result in a panic.
                             if current.process.pid() == 1
-                                && (!self.processes.is_empty()
-                                || !self.sleeping_processes.is_empty()
-                                || !self.waiting_processes.is_empty())
+                                && !(self.processes.is_empty()
+                                && self.sleeping_processes.is_empty()
+                                && self.waiting_processes.is_empty())
                             {
                                 self.will_panic = true;
                             }
