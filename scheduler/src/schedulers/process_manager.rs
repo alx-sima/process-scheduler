@@ -191,12 +191,19 @@ impl<T> ProcessManager<T>
             StopReason::Syscall { syscall, remaining } => {
                 if let Some(current) = self.current_process.as_mut() {
                     self.clock += current.remaining_timeslice - remaining;
+                    let execution_time = current.remaining_timeslice - remaining - 1;
+
+                    current.process.add_execution_time(execution_time);
                     current.process.add_syscall();
+                    current.process.set_last_update(self.clock);
+
                     current.syscall_cycles += 1;
+                    current.remaining_timeslice = remaining;
                 }
 
                 let syscall_result = match syscall {
-                    Fork(priority) => {
+                    Fork(priority) => {// Add the execution time to the current process' counter.
+
                         self.max_pid += 1;
                         let new_process = T::create_process(self, priority);
                         let new_pid = new_process.pid();
@@ -267,20 +274,12 @@ impl<T> ProcessManager<T>
                     }
                 };
 
-                // Add the execution time to the current process' counter.
+                // Preempt the process if it doesn't have enough time left.
                 if let Some(current) = self.current_process.as_mut()
                 {
-                    if current.process.state() == ProcessState::Running {
-                        let execution_time = current.remaining_timeslice - remaining - 1;
-                        current.process.add_execution_time(execution_time);
-                        current.remaining_timeslice = remaining;
-                        current.process.set_last_update(self.clock);
-
-                        // Preempt the process if it doesn't have enough time left.
-                        if current.remaining_timeslice < self.minimum_remaining_timeslice {
-                            current.process.set_state(ProcessState::Ready);
-                            current.process.add_execution_time(current.execution_cycles);
-                        }
+                    if current.remaining_timeslice < self.minimum_remaining_timeslice {
+                        current.process.set_state(ProcessState::Ready);
+                        current.process.add_execution_time(current.execution_cycles);
                     }
                 }
 

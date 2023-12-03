@@ -51,7 +51,7 @@ impl ProcessInformation for CfsProcessMeta {
     fn create_process(scheduler: &ProcessManager<Self>, priority: i8) -> Self {
         let vruntime = scheduler
             .get_processes()
-            .map(|x| x.vruntime())
+            .map(|process| process.vruntime())
             .min()
             .unwrap_or_default();
 
