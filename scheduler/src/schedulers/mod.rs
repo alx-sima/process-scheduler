@@ -10,15 +10,13 @@
 //! ```
 //!
 
-// TODO delete this example
-mod empty;
-pub use empty::Empty;
-
 mod process_manager;
 
-// TODO import your schedulers here
 mod round_robin;
 pub use round_robin::RoundRobin;
 
 mod priority_queue;
 pub use priority_queue::PriorityQueue;
+
+mod cfs;
+pub use cfs::Cfs;
