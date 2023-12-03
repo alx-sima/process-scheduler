@@ -20,7 +20,7 @@ pub struct ProcessMeta {
     timings: (usize, usize, usize),
 }
 
-pub trait ProcessInformation: Process {
+pub trait ProcessInformation: Process + Sized {
     fn set_state(&mut self, state: ProcessState);
     fn last_update(&self) -> usize;
     fn set_last_update(&mut self, last_update: usize);
@@ -30,6 +30,17 @@ pub trait ProcessInformation: Process {
     fn as_process(&self) -> &dyn Process;
     fn increase_priority(&mut self) {}
     fn decrease_priority(&mut self) {}
+    fn vruntime(&self) -> usize {
+        0
+    }
+
+    fn alloc(scheduler: &ProcessManager<Self>, priority: i8) -> Self;
+    fn get_next_process(
+        processes: &mut VecDeque<Self>,
+        current_process: &mut Option<CurrentProcessMeta<Self>>,
+        timeslice_factor: &mut usize,
+        timeslice: NonZeroUsize,
+    );
 }
 
 impl ProcessInformation for ProcessMeta {
@@ -62,21 +73,56 @@ impl ProcessInformation for ProcessMeta {
     fn as_process(&self) -> &dyn Process {
         self
     }
+    fn alloc(scheduler: &ProcessManager<Self>, priority: i8) -> Self {
+        Self::new(Pid::new(scheduler.max_pid), priority, scheduler.clock)
+    }
+
+    fn get_next_process(
+        processes: &mut VecDeque<Self>,
+        current_process: &mut Option<CurrentProcessMeta<Self>>,
+        _timeslice_factor: &mut usize,
+        timeslice: NonZeroUsize,
+    ) {
+        if let Some(current) = current_process {
+            if current.process.state() == ProcessState::Running {
+                return;
+            }
+        }
+
+        if let Some(current) = current_process.take() {
+            processes.push_back(current.process);
+        }
+        let mut waiting_processes = VecDeque::new();
+
+        while let Some(mut process) = processes.pop_front() {
+            if process.state() == ProcessState::Ready {
+                process.set_state(ProcessState::Running);
+                processes.extend(waiting_processes);
+
+                *current_process = Some(CurrentProcessMeta {
+                    process,
+                    remaining_timeslice: timeslice.get(),
+                    execution_cycles: 0,
+                    syscall_cycles: 0,
+                });
+                return;
+            }
+            waiting_processes.push_back(process);
+        }
+
+        *processes = waiting_processes;
+    }
 }
 
 impl ProcessMeta {
-    pub fn new(scheduler: &ProcessManager, priority: i8) -> Self {
+    pub fn new(pid: Pid, priority: i8, creation_time: usize) -> Self {
         Self {
-            pid: Pid::new(scheduler.max_pid),
+            pid,
             priority,
-            last_update: scheduler.clock,
+            last_update: creation_time,
             state: ProcessState::Ready,
             timings: (0, 0, 0),
         }
-    }
-
-    pub fn alloc(scheduler: &ProcessManager, priority: i8) -> Box<dyn ProcessInformation + Send> {
-        Box::new(Self::new(scheduler, priority))
     }
 }
 
@@ -103,9 +149,9 @@ impl Process for ProcessMeta {
 }
 
 /// Information about the process that is currently using the CPU.
-pub struct CurrentProcessMeta {
+pub struct CurrentProcessMeta<T> {
     /// The current process.
-    pub process: ProcessEntry,
+    pub process: T,
     /// The cycles that the process has executed on this run.
     pub execution_cycles: usize,
     /// The cycles that the process has spent in syscalls on this run.
@@ -113,20 +159,7 @@ pub struct CurrentProcessMeta {
     /// The time this process has left before it is preempted.
     pub remaining_timeslice: usize,
 }
-
-pub type ProcessEntry = Box<dyn ProcessInformation + Send>;
-
-pub type ProcessGetter = Box<
-    dyn FnMut(
-            &mut VecDeque<ProcessEntry>,
-            &mut Option<CurrentProcessMeta>,
-            &mut usize,
-            NonZeroUsize,
-        ) + Send,
->;
-pub type ProcessConstructor = Box<dyn Fn(&ProcessManager, i8) -> ProcessEntry + Send>;
-
-pub struct ProcessManager {
+pub struct ProcessManager<T> {
     pub timeslice_factor: usize,
     /// The maximum timeslice that is given to each process.
     pub timeslice: NonZeroUsize,
@@ -137,32 +170,20 @@ pub struct ProcessManager {
     pub will_panic: bool,
     /// The maximum pid that has been assigned yet.
     pub max_pid: usize,
-    pub processes: VecDeque<ProcessEntry>,
-    pub sleeping_processes: VecDeque<(ProcessEntry, usize)>,
-    pub waiting_processes: HashMap<usize, VecDeque<ProcessEntry>>,
+    pub processes: VecDeque<T>,
+    pub sleeping_processes: VecDeque<(T, usize)>,
+    pub waiting_processes: HashMap<usize, VecDeque<T>>,
     /// The process that is currently running (or None if there isn't one).
-    pub current_process: Option<CurrentProcessMeta>,
+    pub current_process: Option<CurrentProcessMeta<T>>,
     /// The number of clock cycles that have passed since the scheduler was started.
     pub clock: usize,
-    next: ProcessGetter,
-    constructor: ProcessConstructor,
 }
 
-impl ProcessManager {
-    pub fn new(
-        timeslice: NonZeroUsize,
-        minimum_remaining_timeslice: usize,
-        next: Box<
-            impl FnMut(
-                    &mut VecDeque<ProcessEntry>,
-                    &mut Option<CurrentProcessMeta>,
-                    &mut usize,
-                    NonZeroUsize,
-                ) + Send
-                + 'static,
-        >,
-        constructor: Box<impl Fn(&Self, i8) -> ProcessEntry + Send + 'static>,
-    ) -> Self {
+impl<T> ProcessManager<T>
+where
+    T: ProcessInformation + Send,
+{
+    pub fn new(timeslice: NonZeroUsize, minimum_remaining_timeslice: usize) -> Self {
         Self {
             timeslice_factor: 1,
             minimum_remaining_timeslice,
@@ -170,8 +191,6 @@ impl ProcessManager {
             sleeping_processes: VecDeque::new(),
             waiting_processes: HashMap::new(),
             current_process: None,
-            next,
-            constructor,
             will_panic: false,
             max_pid: 0,
             timeslice,
@@ -179,7 +198,7 @@ impl ProcessManager {
         }
     }
 
-    pub fn next(&mut self) -> SchedulingDecision {
+    pub fn get_next_process(&mut self) -> SchedulingDecision {
         self.update_timings();
         self.wake_processes();
 
@@ -187,7 +206,7 @@ impl ProcessManager {
             return SchedulingDecision::Panic;
         }
 
-        (self.next)(
+        T::get_next_process(
             &mut self.processes,
             &mut self.current_process,
             &mut self.timeslice_factor,
@@ -223,19 +242,17 @@ impl ProcessManager {
         }
     }
 
-    pub fn get_processes(&self) -> Vec<&ProcessEntry> {
+    pub fn get_processes(&self) -> impl Iterator<Item = &T> {
         let mut processes = Vec::new();
 
         if let Some(current) = &self.current_process {
-            processes.push(current.process.as_ref());
+            processes.push(current.process.as_process());
         }
         self.processes
             .iter()
             .chain(self.current_process.iter().map(|x| &x.process))
             .chain(self.sleeping_processes.iter().map(|(x, _)| x))
             .chain(self.waiting_processes.values().flatten())
-            .inspect(|x| print!("{} ", x.extra()))
-            .collect()
     }
 
     /// Wake up all processes that finished waiting.
@@ -278,7 +295,7 @@ impl ProcessManager {
         }
     }
 
-    pub fn handle_stop(&mut self, reason: StopReason) -> SyscallResult {
+    pub fn handle_process_stop(&mut self, reason: StopReason) -> SyscallResult {
         match reason {
             StopReason::Syscall { syscall, remaining } => {
                 if let Some(current) = self.current_process.as_mut() {
@@ -290,7 +307,7 @@ impl ProcessManager {
                 let syscall_result = match syscall {
                     Fork(priority) => {
                         self.max_pid += 1;
-                        let new_process = (self.constructor)(self, priority);
+                        let new_process = T::alloc(self, priority);
                         let new_pid = new_process.pid();
                         self.processes.push_back(new_process);
 

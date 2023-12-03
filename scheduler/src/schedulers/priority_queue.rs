@@ -1,9 +1,9 @@
 use std::{cmp::Ordering, collections::VecDeque, num::NonZeroUsize};
 
-use crate::{Process, ProcessState, Scheduler, SchedulingDecision, StopReason};
+use crate::{Pid, Process, ProcessState, Scheduler, SchedulingDecision, StopReason};
 
 use super::process_manager::{
-    CurrentProcessMeta, ProcessEntry, ProcessInformation, ProcessManager, ProcessMeta,
+    CurrentProcessMeta, ProcessInformation, ProcessManager, ProcessMeta,
 };
 
 struct PriorityProcessMeta {
@@ -12,15 +12,11 @@ struct PriorityProcessMeta {
 }
 
 impl PriorityProcessMeta {
-    fn new(scheduler: &ProcessManager, priority: i8) -> Self {
+    fn new(pid: Pid, priority: i8, creation_time: usize) -> Self {
         Self {
-            inner: ProcessMeta::new(scheduler, priority),
+            inner: ProcessMeta::new(pid, priority, creation_time),
             max_priority: priority,
         }
-    }
-
-    fn alloc(scheduler: &ProcessManager, priority: i8) -> Box<dyn ProcessInformation + Send> {
-        Box::new(Self::new(scheduler, priority))
     }
 }
 
@@ -62,6 +58,49 @@ impl ProcessInformation for PriorityProcessMeta {
         self.inner.priority -= 1;
         self.inner.priority = self.inner.priority.max(0);
     }
+
+    fn alloc(scheduler: &ProcessManager<Self>, priority: i8) -> Self {
+        Self::new(Pid::new(scheduler.max_pid), priority, scheduler.clock)
+    }
+    fn get_next_process(
+        processes: &mut VecDeque<Self>,
+        current_process: &mut Option<CurrentProcessMeta<Self>>,
+        _timeslice_factor: &mut usize,
+        timeslice: NonZeroUsize,
+    ) {
+        if let Some(current) = current_process {
+            if current.process.state() == ProcessState::Running {
+                return;
+            }
+        }
+
+        if let Some(current) = current_process.take() {
+            processes.push_back(current.process);
+        }
+        let mut next_process = None;
+
+        for (index, process) in processes.iter().enumerate() {
+            if let Some((_, max_proc)) = next_process {
+                if process > max_proc && process.state() == ProcessState::Ready {
+                    next_process = Some((index, process));
+                }
+            } else {
+                next_process = Some((index, process));
+            }
+        }
+
+        if let Some((index, _)) = next_process {
+            if let Some(mut process) = processes.remove(index) {
+                process.set_state(ProcessState::Running);
+                *current_process = Some(CurrentProcessMeta {
+                    process,
+                    execution_cycles: 0,
+                    syscall_cycles: 0,
+                    remaining_timeslice: timeslice.get(),
+                });
+            }
+        }
+    }
 }
 
 impl Process for PriorityProcessMeta {
@@ -86,15 +125,15 @@ impl Process for PriorityProcessMeta {
     }
 }
 
-pub struct PriorityQueue(ProcessManager);
+pub struct PriorityQueue(ProcessManager<PriorityProcessMeta>);
 
-impl PartialEq for &(dyn ProcessInformation + Send) {
+impl PartialEq for PriorityProcessMeta {
     fn eq(&self, other: &Self) -> bool {
         self.priority().eq(&other.priority())
     }
 }
 
-impl PartialOrd for &(dyn ProcessInformation + Send) {
+impl PartialOrd for PriorityProcessMeta {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.priority().partial_cmp(&other.priority())
     }
@@ -102,18 +141,13 @@ impl PartialOrd for &(dyn ProcessInformation + Send) {
 
 impl PriorityQueue {
     pub fn new(timeslice: NonZeroUsize, minimum_remaining_timeslice: usize) -> Self {
-        Self(ProcessManager::new(
-            timeslice,
-            minimum_remaining_timeslice,
-            Box::new(get_next_process),
-            Box::new(PriorityProcessMeta::alloc),
-        ))
+        Self(ProcessManager::new(timeslice, minimum_remaining_timeslice))
     }
 }
 
 impl Scheduler for PriorityQueue {
     fn next(&mut self) -> SchedulingDecision {
-        self.0.next()
+        self.0.get_next_process()
     }
 
     fn stop(&mut self, reason: StopReason) -> crate::SyscallResult {
@@ -128,53 +162,10 @@ impl Scheduler for PriorityQueue {
                 }
             }
         }
-        self.0.handle_stop(reason)
+        self.0.handle_process_stop(reason)
     }
 
     fn list(&mut self) -> Vec<&dyn crate::Process> {
-        self.0
-            .get_processes()
-            .iter()
-            .map(|x| x.as_process())
-            .collect()
-    }
-}
-fn get_next_process(
-    processes: &mut VecDeque<ProcessEntry>,
-    current_process: &mut Option<CurrentProcessMeta>,
-    _timeslice_factor: &mut usize,
-    timeslice: NonZeroUsize,
-) {
-    if let Some(current) = current_process {
-        if current.process.state() == ProcessState::Running {
-            return;
-        }
-    }
-
-    if let Some(current) = current_process.take() {
-        processes.push_back(current.process);
-    }
-    let mut next_process: Option<(usize, &ProcessEntry)> = None;
-
-    for (index, process) in processes.iter().enumerate() {
-        if let Some((_, max_proc)) = next_process {
-            if process.as_ref() > max_proc.as_ref() && process.state() == ProcessState::Ready {
-                next_process = Some((index, process));
-            }
-        } else {
-            next_process = Some((index, process));
-        }
-    }
-
-    if let Some((index, _)) = next_process {
-        if let Some(mut process) = processes.remove(index) {
-            process.set_state(ProcessState::Running);
-            *current_process = Some(CurrentProcessMeta {
-                process,
-                execution_cycles: 0,
-                syscall_cycles: 0,
-                remaining_timeslice: timeslice.get(),
-            });
-        }
+        self.0.get_processes().map(|x| x.as_process()).collect()
     }
 }
