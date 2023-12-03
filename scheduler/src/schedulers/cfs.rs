@@ -1,4 +1,5 @@
 use std::{cmp::Ordering, collections::VecDeque, num::NonZeroUsize};
+use std::ops::{Add, AddAssign};
 
 use crate::{Pid, Process, ProcessState, Scheduler, StopReason, SyscallResult};
 use crate::schedulers::round_robin::ProcessMeta;
@@ -132,12 +133,14 @@ impl ProcessInformation for CfsProcessMeta {
 
     fn add_execution_time(&mut self, time: usize) {
         self.inner.add_execution_time(time);
-        self.vruntime += time;
+        *self += time;
     }
+
     fn add_syscall(&mut self) {
         self.inner.add_syscall();
-        self.vruntime += 1;
+        *self += 1;
     }
+
     fn vruntime(&self) -> usize {
         self.vruntime
     }
@@ -177,5 +180,22 @@ impl PartialOrd for CfsProcessMeta {
             Some(Ordering::Equal) => self.inner.pid().partial_cmp(&other.inner.pid()),
             x => x,
         }
+    }
+}
+
+impl Add<usize> for CfsProcessMeta {
+    type Output = Self;
+
+    fn add(self, rhs: usize) -> Self::Output {
+        Self {
+            inner: self.inner,
+            vruntime: self.vruntime + rhs,
+        }
+    }
+}
+
+impl AddAssign<usize> for CfsProcessMeta {
+    fn add_assign(&mut self, rhs: usize) {
+        self.vruntime += rhs;
     }
 }
