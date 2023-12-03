@@ -68,8 +68,7 @@ impl ProcessInformation for CfsProcessMeta {
         timeslice_factor: &mut usize,
         timeslice: NonZeroUsize,
     ) {
-        let process_number = processes.len();
-        *timeslice_factor = process_number.max(1);
+        *timeslice_factor = processes.len();
 
         if let Some(current) = current_process {
             *timeslice_factor += 1;
@@ -84,9 +83,6 @@ impl ProcessInformation for CfsProcessMeta {
             processes.push_back(current.process);
         }
 
-        processes
-            .iter()
-            .for_each(|x| println!(" ({:?}): {:?} {:?}", x.pid(), x.state(), x.extra()));
         let mut next_process: Option<(usize, &CfsProcessMeta)> = None;
         for (index, process) in processes.iter().enumerate() {
             if process.state() != ProcessState::Ready {
@@ -177,14 +173,9 @@ impl PartialEq for CfsProcessMeta {
 
 impl PartialOrd for CfsProcessMeta {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        println!(
-            "comparant: {:?} ({:?}) vs minimul curent: {:?} ({:?}), rezultat: {:?}",
-            self.extra(),
-            self.pid(),
-            other.extra(),
-            other.pid(),
-            self.vruntime.cmp(&other.vruntime)
-        );
-        Some(self.vruntime.cmp(&other.vruntime))
+        match self.vruntime.partial_cmp(&other.vruntime) {
+            Some(Ordering::Equal) => self.inner.pid().partial_cmp(&other.inner.pid()),
+            x => x,
+        }
     }
 }

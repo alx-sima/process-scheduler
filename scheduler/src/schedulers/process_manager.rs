@@ -267,42 +267,33 @@ impl<T> ProcessManager<T>
                     }
                 };
 
-                // Update the timer.
-                if let Some(CurrentProcessMeta {
-                                execution_cycles,
-                                syscall_cycles,
-                                remaining_timeslice,
-                                process,
-                                ..
-                            }) = self.current_process.as_mut()
+                // Add the execution time to the current process' counter.
+                if let Some(current) = self.current_process.as_mut()
                 {
-                    if process.state() == ProcessState::Running {
-                        let execution_time = *remaining_timeslice - remaining;
-                        if execution_time > *syscall_cycles {
-                            *execution_cycles += execution_time - *syscall_cycles;
-                        }
-                        *remaining_timeslice = remaining;
-                        process.set_last_update(self.clock);
-                    }
-                }
-                self.update_timings();
+                    if current.process.state() == ProcessState::Running {
+                        let execution_time = current.remaining_timeslice - remaining - 1;
+                        current.process.add_execution_time(execution_time);
+                        current.remaining_timeslice = remaining;
+                        current.process.set_last_update(self.clock);
 
-                if let Some(current) = self.current_process.as_mut() {
-                    if current.remaining_timeslice < self.minimum_remaining_timeslice {
-                        current.process.set_state(ProcessState::Ready);
-                        current.process.add_execution_time(current.execution_cycles);
+                        // Preempt the process if it doesn't have enough time left.
+                        if current.remaining_timeslice < self.minimum_remaining_timeslice {
+                            current.process.set_state(ProcessState::Ready);
+                            current.process.add_execution_time(current.execution_cycles);
+                        }
                     }
                 }
+
                 syscall_result
             }
             StopReason::Expired => {
                 if let Some(current) = self.current_process.as_mut() {
+                    let process = &mut current.process;
                     self.clock += current.remaining_timeslice;
-                    current.process.set_state(ProcessState::Ready);
-                    current
-                        .process
-                        .add_execution_time(current.remaining_timeslice);
-                    current.process.set_last_update(self.clock);
+
+                    process.set_state(ProcessState::Ready);
+                    process.add_execution_time(current.remaining_timeslice);
+                    process.set_last_update(self.clock);
 
                     self.update_timings();
 
@@ -358,15 +349,10 @@ impl<T> ProcessManager<T>
 
     /// Get an iterator over all processes.
     pub(super) fn get_processes(&self) -> impl Iterator<Item=&T> {
-        let mut processes = Vec::new();
-
-        if let Some(current) = &self.current_process {
-            processes.push(current.process.as_process());
-        }
         self.processes
             .iter()
-            .chain(self.current_process.iter().map(|x| &x.process))
-            .chain(self.sleeping_processes.iter().map(|(x, _)| x))
+            .chain(self.current_process.iter().map(|current| &current.process))
+            .chain(self.sleeping_processes.iter().map(|(process, _)| process))
             .chain(self.waiting_processes.values().flatten())
     }
 }
