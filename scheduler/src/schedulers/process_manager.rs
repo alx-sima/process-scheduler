@@ -162,20 +162,14 @@ impl<T> ProcessManager<T>
         }
 
         // There aren't any ready processes, wait for the first to wake up.
-        if let Some(first_wake) = self
+        if let Some(wait_time) = self
             .sleeping_processes
             .iter()
-            .map(|(_, wake_time)| wake_time)
+            .filter_map(|(_, wake_time)| NonZeroUsize::new(wake_time - self.clock))
             .min()
         {
-            let wait_interval = first_wake - self.clock;
-            self.clock = *first_wake;
-
-            // This won't fail, because, for sleeping processes,
-            // wake_time is later than self.clock (now).
-            let sleep_duration = NonZeroUsize::new(wait_interval).unwrap();
-
-            SchedulingDecision::Sleep(sleep_duration)
+            self.clock += wait_time.get();
+            SchedulingDecision::Sleep(wait_time)
         } else {
             // There are no processes to be awaken. If there still
             // are processes waiting, signal a deadlock.
@@ -209,7 +203,6 @@ impl<T> ProcessManager<T>
 
                 let syscall_result = match syscall {
                     Fork(priority) => {
-
                         self.max_pid += 1;
                         let new_process = T::create_process(self, priority);
                         let new_pid = new_process.pid();
